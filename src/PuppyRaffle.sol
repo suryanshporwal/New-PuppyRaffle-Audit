@@ -93,14 +93,14 @@ contract PuppyRaffle is ERC721, Ownable {
 
     /// @param playerIndex the index of the player to refund. You can find it externally by calling `getActivePlayerIndex`
     /// @dev This function will allow there to be blank spots in the array
-    function refund(uint256 playerIndex) public {
+    function refund(uint256 playerIndex) public { // @vulnerability
         address playerAddress = players[playerIndex];
         require(playerAddress == msg.sender, "PuppyRaffle: Only the player can refund");
         require(playerAddress != address(0), "PuppyRaffle: Player already refunded, or is not active");
 
         payable(msg.sender).sendValue(entranceFee);
 
-        players[playerIndex] = address(0);
+        players[playerIndex] = address(0); // <--- CEI voilation reentrancy @audit High 
         emit RaffleRefunded(playerAddress);
     }
 
@@ -113,7 +113,7 @@ contract PuppyRaffle is ERC721, Ownable {
                 return i;
             }
         }
-        return 0;
+        return 0;  // @audit Informational vulnerblity, 0 will represent 0th index, need some other symbol or error..
     }
 
     /// @notice this function will select a winner and mint a puppy
@@ -154,7 +154,7 @@ contract PuppyRaffle is ERC721, Ownable {
     }
 
     /// @notice this function will withdraw the fees to the feeAddress
-    function withdrawFees() external {
+    function withdrawFees() external { // @audit -> should require owner to withdraw fees? or shouldn't?
         require(address(this).balance == uint256(totalFees), "PuppyRaffle: There are currently players active!");
         uint256 feesToWithdraw = totalFees;
         totalFees = 0;
